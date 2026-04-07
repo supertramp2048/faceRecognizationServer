@@ -13,7 +13,11 @@ import json
 import threading
 from dotenv import load_dotenv
 from datetime import datetime
-load_dotenv("./.env")
+from functools import wraps
+
+# Load .env từ thư mục hiện tại của script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 app = Flask(__name__)
 # Khôi phục dùng thư viện CORS để tự động xử lý preflight OPTIONS
@@ -21,27 +25,115 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ================= CẤU HÌNH THINGSBOARD =================
 THINGSBOARD_SERVER = "demo.thingsboard.io"
-ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
+
+def verify_token_with_thingsboard(token):
+    """
+    Verify Bearer token từ ThingsBoard
+    Gọi endpoint ThingsBoard để kiểm tra token có hợp lệ không
+    """
+    try:
+        print(f">> Verifying token: {token[:20]}...") # Debug
+        
+        verify_url = f"https://{THINGSBOARD_SERVER}/api/auth/user"
+        
+        response = requests.get(verify_url, headers={'Authorization': f'Bearer {token}'})
+        
+        print(f">> ThingsBoard response status: {response.status_code}") # Debug
+        
+        if response.status_code == 200:
+            # Token hợp lệ, trả về user info
+            print(f">> Token hợp lệ - User: {response.json()}") # Debug
+            return True, response.json()
+        else:
+            # Token không hợp lệ
+            print(f">> Token không hợp lệ - Response: {response.text}") # Debug
+            return False, None
+    except Exception as e:
+        print(f">> Loi khi verify token: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, None
+
+def token_required(f):
+    """
+    Decorator để kiểm tra Bearer token trong header
+    Sử dụng: @token_required
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Skip token verify cho CORS preflight OPTIONS request
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+        
+        print(f">> Request headers: {dict(request.headers)}") # Debug
+        
+        token = None
+        
+        # Kiểm tra Authorization header
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            print(f">> Authorization header: {auth_header}") # Debug
+            try:
+                # Format: "Bearer <token>"
+                token = auth_header.split(" ")[1]
+                print(f">> Extracted token: {token[:20]}...") # Debug
+            except IndexError:
+                print(">> ERROR: Invalid authorization header format") # Debug
+                return jsonify({"status": "error", "message": "Invalid authorization header format"}), 401
+        else:
+            print(">> ERROR: Authorization header not found") # Debug
+        
+        if not token:
+            return jsonify({"status": "error", "message": "Token is missing"}), 401
+        
+        # Verify token với ThingsBoard
+        is_valid, user_info = verify_token_with_thingsboard(token)
+        
+        if not is_valid:
+            return jsonify({"status": "error", "message": "Invalid or expired token"}), 401
+        
+        # Lưu thông tin user vào request context để dùng trong function
+        request.user_info = user_info
+        request.access_token = token
+        
+        return f(*args, **kwargs)
+    
+    return decorated_function
 
 def send_to_thingsboard(person_name):
+    ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
     url = f"https://{THINGSBOARD_SERVER}/api/v1/{ACCESS_TOKEN}/telemetry"
     headers = {'Content-Type': 'application/json'}
+    
+    # Timestamp theo milliseconds (như ThingsBoard yêu cầu)
+    current_timestamp = int(datetime.now().timestamp() * 1000)
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     payload = {
         "door": True,
         "person_name": person_name,
-        "open_time": current_time
+        "open_time": current_time,
+        "ts": current_timestamp
     }
     
     try:
-        response = requests.post(url, data=json.dumps(payload), headers=headers)
+        print(f"DEBUG - Sending to: {url[:60]}...")
+        print(f"DEBUG - Payload: {payload}")
+        
+        # Dùng json= thay vì data=json.dumps()
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        
+        print(f"DEBUG - Status: {response.status_code}")
+        print(f"DEBUG - Response: {response.text}")
+        
         if response.status_code == 200:
             print(f">> Da gui du lieu len ThingsBoard: {payload}")
         else:
             print(f">> Loi ThingsBoard: {response.status_code} - {response.text}")
     except Exception as e:
         print(f">> Loi ket noi ThingsBoard: {e}")
+        import traceback
+        traceback.print_exc()
 
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
@@ -53,24 +145,11 @@ face_mesh = mp_face_mesh.FaceMesh(
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ================= ĐỊA CHỈ ESP32-CAM =================
-ESP32_STREAM_URL = "http://mycam.local:81/stream"  
-MDNS_NAME = "mycam.local"
-STREAM_PORT_PATH = ":81/stream"
-cached_esp_ip = None
+ESP32_STREAM_URL = "http://192.168.22.74:81/stream"  
+
 
 def get_esp32_url():
-    global cached_esp_ip
-    if cached_esp_ip is not None:
-        return f"http://{cached_esp_ip}{STREAM_PORT_PATH}"
-    print(f">> Dang tim kiem {MDNS_NAME} trong mang (Chi mat thoi gian o buoc nay)...")
-    try:
-        esp_ip = socket.gethostbyname(MDNS_NAME)
-        cached_esp_ip = esp_ip 
-        print(f">> THANH CONG! Da luu IP cua camera la: {cached_esp_ip}")
-        return f"http://{cached_esp_ip}{STREAM_PORT_PATH}"
-    except Exception as e:
-        print(f">> LOI: Khong tim thay {MDNS_NAME}.")
-        return None 
+        return ESP32_STREAM_URL 
     
 # ================= KHỞI TẠO MODEL AI =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -198,6 +277,7 @@ load_faces()
 
 # ================= NHẬN DIỆN TỪ STREAM =================
 @app.route('/trigger_stream', methods=['GET'])
+@token_required
 def trigger_stream():
     print("\n" + "="*50)
     print("BAT DAU TRUY CAP STREAM & NHAN DIEN...")
@@ -316,6 +396,7 @@ def trigger_stream():
 
 # ================= ĐĂNG KÝ NGƯỜI DÙNG MỚI QUA STREAM =================
 @app.route('/register', methods=['GET', 'POST', 'OPTIONS'])
+@token_required
 def register():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -453,9 +534,55 @@ def register():
 
 # ================= LIỆT KÊ TÊN NGƯỜI DÙNG =================
 @app.route('/list', methods=['GET'])
+@token_required
 def list_users():
-    unique_names = list(set(known_names))
+    unique_names = list(set([n.split('_')[0] for n in known_names]))
     return jsonify(unique_names)
+
+# ================= XÓA KHUÔN MẶT THEO TÊN =================
+@app.route('/delete', methods=['POST', 'OPTIONS'])
+@token_required
+def delete_user():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    try:
+        name = request.json.get('name') or request.args.get('name')
+        
+        if not name:
+            return jsonify({"status": "error", "message": "Thiếu tham số name"}), 400
+        
+        print(f"\n--- BAT DAU XOA KHUON MAT: {name} ---")
+        
+        deleted_count = 0
+        with db_lock:
+            # Xóa tất cả ảnh của người dùng
+            for file in os.listdir(DB_PATH):
+                if file.startswith(f"{name}_") and file.endswith(('.jpg', '.png')):
+                    file_path = os.path.join(DB_PATH, file)
+                    os.remove(file_path)
+                    deleted_count += 1
+                    print(f"  -> Xóa: {file}")
+        
+        if deleted_count == 0:
+            return jsonify({"status": "error", "message": f"Không tìm thấy khuôn mặt của {name}"}), 404
+        
+        # Rebuild database vector
+        print(f">> Đã xóa {deleted_count} ảnh của {name}. Đang rebuild database...")
+        with db_lock:
+            if os.path.exists(VECTOR_DB_PATH):
+                os.remove(VECTOR_DB_PATH)
+        load_faces()
+        
+        print(f">> Xóa thành công!")
+        return jsonify({"status": "success", "message": f"Đã xóa {deleted_count} ảnh của {name}"}), 200
+        
+    except Exception as e:
+        print(f"=== LỖI KHI XÓA ===")
+        print(str(e))
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": "Lỗi hệ thống"}), 500
 
 # ================= KHỞI CHẠY SERVER =================
 if __name__ == '__main__':
