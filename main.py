@@ -145,7 +145,7 @@ face_mesh = mp_face_mesh.FaceMesh(
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ================= ĐỊA CHỈ ESP32-CAM =================
-ESP32_STREAM_URL = "http://192.168.22.74:81/stream"  
+ESP32_STREAM_URL = "http://10.161.70.89:81/stream"  
 
 
 def get_esp32_url():
@@ -277,7 +277,7 @@ load_faces()
 
 # ================= NHẬN DIỆN TỪ STREAM =================
 @app.route('/trigger_stream', methods=['GET'])
-@token_required
+
 def trigger_stream():
     print("\n" + "="*50)
     print("BAT DAU TRUY CAP STREAM & NHAN DIEN...")
