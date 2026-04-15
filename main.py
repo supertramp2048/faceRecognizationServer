@@ -145,11 +145,10 @@ face_mesh = mp_face_mesh.FaceMesh(
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ================= ĐỊA CHỈ ESP32-CAM =================
-ESP32_STREAM_URL = "http://10.161.70.89:81/stream"  
-
+ESP32_STREAM_URL = os.getenv('ESP32_STREAM_URL') 
 
 def get_esp32_url():
-        return ESP32_STREAM_URL 
+        return ESP32_STREAM_URL
     
 # ================= KHỞI TẠO MODEL AI =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -182,8 +181,8 @@ known_faces = []
 known_names = []
 db_lock = threading.Lock() 
 
-DB_PATH = "faces"
-VECTOR_DB_PATH = "faces_db.npz"
+DB_PATH = os.path.join(BASE_DIR, "faces")
+VECTOR_DB_PATH = os.path.join(BASE_DIR, "faces_db.npz")
 
 if not os.path.exists(DB_PATH):
     os.makedirs(DB_PATH)
@@ -277,7 +276,6 @@ load_faces()
 
 # ================= NHẬN DIỆN TỪ STREAM =================
 @app.route('/trigger_stream', methods=['GET'])
-
 def trigger_stream():
     print("\n" + "="*50)
     print("BAT DAU TRUY CAP STREAM & NHAN DIEN...")
@@ -300,11 +298,14 @@ def trigger_stream():
     max_frames = 150 
     frame_count = 0
     match_found = False
-    has_blinked = False
     
     buffer_size = 5    
     min_votes = 3      
     recent_faces = []  
+    
+    # Thêm biến trạng thái để chia luồng
+    identity_confirmed = False
+    confirmed_name = ""
 
     while frame_count < max_frames:
         ret, img = cap.read()
@@ -315,7 +316,54 @@ def trigger_stream():
         frame_count += 1
         h_img, w_img, _ = img.shape
         
-        if not has_blinked:
+        # BƯỚC 1: KIỂM TRA VÀ XÁC NHẬN KHUÔN MẶT TRƯỚC
+        if not identity_confirmed:
+            cv2.putText(img, "DANG NHAN DIEN...", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            detector.setInputSize((w_img, h_img))
+            _, faces = detector.detect(img)
+            
+            if faces is not None:
+                face = faces[0]
+                aligned = recognizer.alignCrop(img, face)
+                feature = recognizer.feature(aligned)
+
+                best_score = 0
+                best_name = "Unknown"
+
+                for i, db_feature in enumerate(known_faces):
+                    score = recognizer.match(feature, db_feature, cv2.FaceRecognizerSF_FR_COSINE)
+                    if score > best_score:
+                        best_score = score
+                        best_name = known_names[i]
+
+                if best_score > 0.45:
+                    real_name = best_name.split('_')[0] 
+                    print(f"  [Frame {frame_count}] Nhan dien tam thoi: {real_name} (Score: {best_score:.4f})")
+                    recent_faces.append(real_name)
+                else:
+                    print(f"  [Frame {frame_count}] Phat hien nguoi la hoac hinh anh mo (Score: {best_score:.4f})")
+                    recent_faces.append("Unknown")
+
+                if len(recent_faces) > buffer_size:
+                    recent_faces.pop(0)
+
+                if len(recent_faces) == buffer_size:
+                    vote_counts = collections.Counter(recent_faces)
+                    most_common_name, most_common_count = vote_counts.most_common(1)[0]
+
+                    if most_common_name != "Unknown" and most_common_count >= min_votes:
+                        print(f"\n>> [XAC NHAN DANH TINH] ==> [{most_common_name}] voi {most_common_count}/{buffer_size} phieu bau. Chuyen sang kiem tra chop mat!")
+                        identity_confirmed = True
+                        confirmed_name = most_common_name
+
+            cv2.imshow("ESP32-CAM Stream", img)
+            cv2.waitKey(1)
+            
+        # BƯỚC 2: KIỂM TRA CHỚP MẮT (CHỈ CHẠY KHI ĐÃ XÁC NHẬN LÀ NGƯỜI QUEN)
+        else:
+            cv2.putText(img, f"CHAO {confirmed_name.upper()}! HAY CHOP MAT DE XAC NHAN!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             results = face_mesh.process(rgb_img)
             
@@ -330,59 +378,20 @@ def trigger_stream():
                 avg_ear = (left_ear + right_ear) / 2.0
                 
                 if avg_ear < 0.22:
-                    has_blinked = True
                     print(f">> [Frame {frame_count}] DA PHAT HIEN CHOP MAT (EAR: {avg_ear:.2f}) -> Nguoi that!")
-
-            if not has_blinked:
-                cv2.putText(img, "HAY CHOP MAT DE XAC NHAN!", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                cv2.imshow("ESP32-CAM Stream", img)
-                cv2.waitKey(1)
-                continue 
-
-        cv2.putText(img, "DANG NHAN DIEN...", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.imshow("ESP32-CAM Stream", img)
-        cv2.waitKey(1)
-
-        detector.setInputSize((w_img, h_img))
-        _, faces = detector.detect(img)
-        
-        if faces is not None:
-            face = faces[0]
-            aligned = recognizer.alignCrop(img, face)
-            feature = recognizer.feature(aligned)
-
-            best_score = 0
-            best_name = "Unknown"
-
-            for i, db_feature in enumerate(known_faces):
-                score = recognizer.match(feature, db_feature, cv2.FaceRecognizerSF_FR_COSINE)
-                if score > best_score:
-                    best_score = score
-                    best_name = known_names[i]
-
-            if best_score > 0.45:
-                real_name = best_name.split('_')[0] 
-                print(f"  [Frame {frame_count}] Nhan dien tam thoi: {real_name} (Score: {best_score:.4f})")
-                recent_faces.append(real_name)
-            else:
-                print(f"  [Frame {frame_count}] Phat hien nguoi la hoac hinh anh mo (Score: {best_score:.4f})")
-                recent_faces.append("Unknown")
-
-            if len(recent_faces) > buffer_size:
-                recent_faces.pop(0)
-
-            if len(recent_faces) == buffer_size:
-                vote_counts = collections.Counter(recent_faces)
-                most_common_name, most_common_count = vote_counts.most_common(1)[0]
-
-                if most_common_name != "Unknown" and most_common_count >= min_votes:
-                    print(f"\n>> [KET QUA CUOI CUNG] ==> XAC NHAN: [{most_common_name}] voi {most_common_count}/{buffer_size} phieu bau hop le!")
+                    print(f"\n>> [KET QUA CUOI CUNG] ==> MO CUA CHO: [{confirmed_name}]")
                     match_found = True
-                    send_to_thingsboard(most_common_name)
+                    send_to_thingsboard(confirmed_name)
                     break 
 
+            cv2.imshow("ESP32-CAM Stream", img)
+            cv2.waitKey(1)
+
     if not match_found:
-        print(f"\n>> DA QUET {frame_count} FRAME: Khong the xac nhan nguoi quen.")
+        if identity_confirmed:
+            print(f"\n>> DA QUET {frame_count} FRAME: Nhan dien duoc {confirmed_name} nhung KHONG vuot qua bai test chop mat.")
+        else:
+            print(f"\n>> DA QUET {frame_count} FRAME: Khong the xac nhan nguoi quen.")
 
     cap.release()
     cv2.destroyAllWindows() 
